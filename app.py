@@ -19,6 +19,7 @@ import csv
 import time
 import logging
 from collections import defaultdict, deque
+from urllib.parse import urlparse, parse_qs
 
 import httpx
 from fastapi import FastAPI, Request
@@ -140,6 +141,19 @@ def guess_name(history_text):
     return m.group(1).strip() if m else ""
 
 
+def _utm_from_url(url):
+    """Pull utm_source/medium/campaign + gclid from a URL's query string (lead attribution)."""
+    out = {}
+    try:
+        q = parse_qs(urlparse(url or "").query)
+        for k in ("utm_source", "utm_medium", "utm_campaign", "gclid"):
+            if q.get(k):
+                out[k] = q[k][0][:200]
+    except Exception:
+        pass
+    return out
+
+
 async def persist_lead(email, name, convo_text, source_url, user_agent):
     """Insert a chat lead into the same Supabase contact_submissions table the form uses."""
     if not (SUPABASE_REST_URL and SUPABASE_ANON_KEY):
@@ -152,10 +166,12 @@ async def persist_lead(email, name, convo_text, source_url, user_agent):
         "last_name": last,
         "email": email,
         "interest": "chat",
+        "lead_type": "chatbot",
         "message": ("[Captured by the website chatbot]\n" + convo_text)[:4000],
         "source_url": source_url,
         "user_agent": user_agent,
     }
+    payload.update(_utm_from_url(source_url))
     headers = {
         "apikey": SUPABASE_ANON_KEY,
         "Authorization": f"Bearer {SUPABASE_ANON_KEY}",
