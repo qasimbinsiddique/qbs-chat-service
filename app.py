@@ -24,7 +24,7 @@ from urllib.parse import urlparse, parse_qs
 import httpx
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, Response
 
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("qbs-chat")
@@ -189,15 +189,21 @@ async def persist_lead(email, name, convo_text, source_url, user_agent):
         log.warning("LEAD persist error: %s", type(e).__name__)
 
 
-async def send_alert(email, name, last_msg):
+async def _post_webhook(msg):
+    """Fire-and-forget POST of a plain message to the Discord/Slack incoming webhook."""
     if not ALERT_WEBHOOK:
         return
-    msg = f"🟢 New website chat lead: {name or 'Chat visitor'} <{email}> — \"{last_msg[:160]}\""
     try:
         async with httpx.AsyncClient(timeout=8) as client:
             await client.post(ALERT_WEBHOOK, json={"content": msg, "text": msg})
     except Exception as e:
         log.warning("Alert error: %s", type(e).__name__)
+
+
+async def send_alert(email, name, last_msg):
+    await _post_webhook(
+        f"🟢 New website chat lead: {name or 'Chat visitor'} <{email}> — \"{last_msg[:160]}\""
+    )
 
 
 # ── Rate limiting (in-memory per-IP sliding window) ───────────────────────────
@@ -290,3 +296,92 @@ async def chat(request: Request):
         await send_alert(emails[0], name, text)
 
     return JSONResponse({"output": reply, "leadCaptured": lead_captured})
+
+
+# ── Contact form ingest + notify ──────────────────────────────────────────────
+# The website's nginx proxies /api/contact-submit -> here (was proxying straight
+# to PostgREST, which saved the lead but notified NOBODY and left a failed save
+# with no trace — a real lead was lost that way on 2026-06-25). This thin handler:
+#   (a) inserts the lead into the same Supabase contact_submissions table,
+#   (b) pings the Discord webhook on success,
+#   (c) dead-letters (logs + alerts) on failure so a lost save is never silent.
+# It preserves the browser contract: 2xx => the form shows success; non-2xx =>
+# the form's retry/error path engages.
+_ALLOWED_LEAD_FIELDS = (
+    "first_name", "last_name", "email", "interest", "message", "lead_type",
+    "source_url", "user_agent", "utm_source", "utm_medium", "utm_campaign", "gclid",
+)
+
+
+async def _insert_contact(payload):
+    """Insert one row into Supabase contact_submissions. Returns (ok, status)."""
+    headers = {
+        "apikey": SUPABASE_ANON_KEY,
+        "Authorization": f"Bearer {SUPABASE_ANON_KEY}",
+        "Content-Type": "application/json",
+        "Prefer": "return=minimal",
+    }
+    async with httpx.AsyncClient(timeout=10) as client:
+        r = await client.post(SUPABASE_REST_URL, json=payload, headers=headers)
+    return (r.status_code in (200, 201, 204), r.status_code)
+
+
+@app.post("/contact-submit")
+async def contact_submit(request: Request):
+    if not (SUPABASE_REST_URL and SUPABASE_ANON_KEY):
+        log.error("CONTACT-SUBMIT misconfigured: Supabase env not set")
+        return JSONResponse({"error": "lead store not configured"}, status_code=500)
+
+    if rate_limited(client_ip(request)):
+        return JSONResponse({"error": "rate_limited"}, status_code=429)
+
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse({"error": "invalid json"}, status_code=400)
+    if not isinstance(body, dict):
+        return JSONResponse({"error": "invalid payload"}, status_code=400)
+
+    # Whitelist + cap fields (never trust the client to set arbitrary columns).
+    payload = {}
+    for k in _ALLOWED_LEAD_FIELDS:
+        v = body.get(k)
+        if v is None or v == "":
+            continue
+        payload[k] = str(v)[:4000]
+
+    email = payload.get("email", "")
+    if not EMAIL_RE.fullmatch(email or ""):
+        return JSONResponse({"error": "valid email required"}, status_code=400)
+
+    name = (payload.get("first_name", "") + " " + payload.get("last_name", "")).strip()
+    last_msg = payload.get("message", "")
+
+    try:
+        ok, status = await _insert_contact(payload)
+    except Exception as e:
+        # Transport failure → dead-letter so the lead is never silently lost.
+        log.error("CONTACT-SUBMIT insert error: %s — lead=%s", type(e).__name__, email)
+        await _post_webhook(
+            f"🔴 DEAD-LETTER website lead (save failed: {type(e).__name__}) — "
+            f"{name or 'Unknown'} <{email}> — \"{last_msg[:160]}\" — capture manually."
+        )
+        return JSONResponse({"error": "save failed"}, status_code=502)
+
+    if not ok:
+        # PostgREST refused (RLS / schema / 4xx-5xx) → dead-letter with the body for manual capture.
+        log.error("CONTACT-SUBMIT insert http %s — lead=%s", status, email)
+        await _post_webhook(
+            f"🔴 DEAD-LETTER website lead (save http {status}) — "
+            f"{name or 'Unknown'} <{email}> — \"{last_msg[:160]}\" — capture manually."
+        )
+        return JSONResponse({"error": "save failed"}, status_code=502)
+
+    # Saved — notify so a lead never pings nobody again.
+    src = payload.get("lead_type", "form")
+    await _post_webhook(
+        f"🟢 New website lead ({src}): {name or 'Unknown'} <{email}> — \"{last_msg[:160]}\""
+    )
+    log.info("CONTACT-SUBMIT saved + alerted: %s", email)
+    # 204 mirrors the old PostgREST return=minimal response the browser expected.
+    return Response(status_code=204)

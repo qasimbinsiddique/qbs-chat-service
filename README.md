@@ -11,6 +11,28 @@ Replaces the dead n8n webhook the widget used to POST to.
 - **200**  →  `{ "output": "<reply>" }`
 - **GET** `/health`  →  `{ "ok": true, "kb_rows": 72, "model": "...", "key_set": true }`
 
+## Contact form ingest (`POST /contact-submit`)
+The website's nginx proxies `/api/contact-submit` here (previously it proxied
+straight to PostgREST, which saved the lead but **notified nobody** and left a
+failed save with **no trace** — a real lead was lost that way on 2026-06-25).
+This handler inserts the lead into the same `contact_submissions` table, pings
+the Discord webhook on success, and **dead-letters** (logs + alerts) on failure.
+
+- **POST** `/contact-submit`  →  same JSON body the lead form sends
+  (`first_name`, `last_name`, `email`, `interest`, `message`, `lead_type`,
+  `source_url`, `user_agent`, `utm_*`, `gclid` — fields are whitelisted/capped).
+- **204** on a confirmed save (mirrors the old PostgREST `return=minimal`, so the
+  browser's `r.ok` success path is unchanged).
+- **400** on bad JSON / missing-or-invalid email · **429** rate-limited ·
+  **500** if `SUPABASE_*` env is unset · **502** on a save failure (PostgREST
+  error or transport failure) → the browser's retry/error path engages and a
+  `🔴 DEAD-LETTER` alert fires for manual capture.
+- Requires `SUPABASE_REST_URL` + `SUPABASE_ANON_KEY` (same as lead persistence)
+  and `ALERT_WEBHOOK` for the notifications.
+
+Run the tests: `./.venv/bin/python test_contact_submit.py` (patches the Supabase
+insert + webhook; asserts every branch above).
+
 ## Run locally
 ```bash
 python3 -m venv .venv && ./.venv/bin/pip install -r requirements.txt
